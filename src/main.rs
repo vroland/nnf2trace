@@ -62,6 +62,15 @@ impl NNFNode {
         }
     }
 
+    pub fn entailed(&self) -> &[ClauseIndex] {
+        match self {
+            NNFNode::Or { ref entailed, .. } => entailed,
+            NNFNode::And { ref entailed, .. } => entailed,
+            NNFNode::True(_) => &[],
+            NNFNode::False(_) => &[],
+        }
+    }
+
     pub fn children_mut(&mut self) -> &mut [NodeIndex] {
         match self {
             NNFNode::Or {
@@ -90,6 +99,7 @@ struct NNFTree {
     root: NodeIndex,
     nodes: HashMap<NodeIndex, NNFNode>,
     max_id: usize,
+    clauses: Vec<Vec<Lit>>,
 }
 
 impl NNFTree {
@@ -190,7 +200,7 @@ impl NNFTree {
         }
     }
 
-    pub fn satisfiable(&self, node: NodeIndex, assumption: &[Lit]) -> bool {
+    fn satisfiable(&self, node: NodeIndex, assumption: &[Lit]) -> bool {
         match self.nodes.get(&node).unwrap() {
             NNFNode::True(_) => true,
             NNFNode::False(_) => false,
@@ -216,12 +226,107 @@ impl NNFTree {
         !self.satisfiable(node, &negated)
     }
 
-    pub fn entailment_annotate(
+    fn smooth_recurse(
         &mut self,
         node: NodeIndex,
-        clauses: &[ClauseIndex],
-        clause_table: &[Vec<Lit>],
+        smooth_nodes: &HashMap<Var, NodeIndex>,
+        missing: &BTreeSet<Var>,
     ) {
+        match self.nodes.get(&node).unwrap() {
+            NNFNode::And { ref children, .. } => {
+                let mut partition: Vec<BTreeSet<Var>> =
+                    children.iter().map(|_c| BTreeSet::new()).collect();
+
+                // Partition missing variables according to children.
+                // We assume assigned variables for each child are non-overlapping,
+                // as explained in the paper.
+                for (i, child) in children.iter().enumerate() {
+                    for cl in self.nodes.get(child).unwrap().entailed() {
+                        for var in self.clauses[*cl].iter().map(|l| l.abs()) {
+                            if missing.contains(&var) {
+                                partition[i].insert(var);
+                            }
+                        }
+                    }
+                }
+
+                // variables to introduce now
+                let introduce: Vec<_> = missing
+                    .iter()
+                    .filter(|v| partition.iter().all(|p| !p.contains(v)))
+                    .collect();
+
+                // is this a conflict node?
+                let conflict = children
+                    .iter()
+                    .any(|c| matches! {self.nodes.get(c), Some(NNFNode::False(_))});
+
+                if !conflict {
+                    let original_children = children.clone();
+                    for (i, child) in original_children.iter().enumerate() {
+                        self.smooth_recurse(*child, smooth_nodes, &partition[i]);
+                    }
+
+                    for var in introduce {
+                        let smooth_id = smooth_nodes.get(var).unwrap();
+                        if !original_children.contains(smooth_id) {
+                            self.nodes.get_mut(&node).unwrap().add_child(*smooth_id)
+                        }
+                    }
+                }
+            }
+
+            NNFNode::Or { ref children, .. } => {
+                if let [child1, child2] = &children[..] {
+                    let (cid1, cid2) = (*child1, *child2);
+                    let c1v = self.varsof(*child1);
+                    let c2v = self.varsof(*child2);
+
+                    let mut c1m: BTreeSet<Var> = c2v.difference(&c1v).copied().collect();
+                    let mut c2m: BTreeSet<Var> = c1v.difference(&c2v).copied().collect();
+                    c1m.extend(missing);
+                    c2m.extend(missing);
+                    self.smooth_recurse(cid1, smooth_nodes, &c1m);
+                    self.smooth_recurse(cid2, smooth_nodes, &c2m);
+                } else {
+                    panic! {"a decision node must have exactly two children!"};
+                }
+            }
+            NNFNode::True(_) | NNFNode::False(_) => (),
+        }
+    }
+
+    pub fn smooth(&mut self, missing: BTreeSet<Var>) {
+        let mut varnode_map = HashMap::new();
+        let tn = NNFNode::True(self.issue_new_id());
+        for v in missing.iter().chain(self.varsof(self.root).iter()).copied() {
+            let child1 = NNFNode::And {
+                id: self.issue_new_id(),
+                children: vec![tn.id()],
+                lits: vec![v],
+                entailed: vec![],
+            };
+            let child2 = NNFNode::And {
+                id: self.issue_new_id(),
+                children: vec![tn.id()],
+                lits: vec![-v],
+                entailed: vec![],
+            };
+            let varnode = NNFNode::Or {
+                id: self.issue_new_id(),
+                children: vec![child1.id(), child2.id()],
+                entailed: vec![],
+            };
+            self.nodes.insert(child1.id(), child1);
+            self.nodes.insert(child2.id(), child2);
+            varnode_map.insert(v, varnode.id());
+            self.nodes.insert(varnode.id(), varnode);
+        }
+        self.nodes.insert(tn.id(), tn);
+        self.smooth_recurse(self.root, &varnode_map, &missing);
+    }
+
+    pub fn entailment_annotate(&mut self, node: NodeIndex, clauses: &[ClauseIndex]) {
         let mut entailed_here = vec![];
 
         match self.nodes.get(&node).unwrap() {
@@ -234,7 +339,7 @@ impl NNFTree {
                 // by the literals and remaining ones
                 let mut solved = vec![];
                 for cl in clauses.iter().copied() {
-                    if clause_table[cl].iter().any(|l| lits.contains(l)) {
+                    if self.clauses[cl].iter().any(|l| lits.contains(l)) {
                         solved.push(cl);
                     } else {
                         entailed_here.push(cl);
@@ -252,7 +357,7 @@ impl NNFTree {
                             let child_entails = entailed_here
                                 .iter()
                                 .copied()
-                                .filter(|cl| self.is_entailed(child, &clause_table[*cl]))
+                                .filter(|cl| self.is_entailed(child, &self.clauses[*cl]))
                                 .collect::<Vec<ClauseIndex>>();
 
                             // we need to clone the child
@@ -260,12 +365,12 @@ impl NNFTree {
                                 let new_child = self.clone_subtree(child);
                                 eprintln! {"cloning {} to {}", child, new_child}
                                 self.nodes.get_mut(&node).unwrap().children_mut()[i] = child;
-                                self.entailment_annotate(new_child, &child_entails, clause_table);
+                                self.entailment_annotate(new_child, &child_entails);
                             } else {
                                 continue;
                             }
                         } else {
-                            self.entailment_annotate(child, &entailed_here, clause_table);
+                            self.entailment_annotate(child, &entailed_here);
                         }
                     }
                 }
@@ -279,7 +384,7 @@ impl NNFTree {
                 entailed_here = clauses
                     .iter()
                     .copied()
-                    .filter(|cl| self.is_entailed(*id, &clause_table[*cl]))
+                    .filter(|cl| self.is_entailed(*id, &self.clauses[*cl]))
                     .collect::<Vec<ClauseIndex>>();
 
                 if !entailed.is_empty() {
@@ -289,7 +394,7 @@ impl NNFTree {
                 }
 
                 for child in children.clone() {
-                    self.entailment_annotate(child, &entailed_here, clause_table);
+                    self.entailment_annotate(child, &entailed_here);
                 }
             }
             NNFNode::True(_) | NNFNode::False(_) => return,
@@ -301,7 +406,7 @@ impl NNFTree {
             .set_entailed_clauses(&entailed_here[..]);
     }
 
-    pub fn parse(lines: impl Iterator<Item = String>) -> Self {
+    pub fn parse(clauses: Vec<Vec<Lit>>, lines: impl Iterator<Item = String>) -> Self {
         let mut nodes = HashMap::new();
         let mut arcs = vec![];
         let mut max_id = 0;
@@ -326,38 +431,30 @@ impl NNFTree {
             max_id = max_id.max(id);
 
             match t {
-                "o" => {
-                    nodes.insert(
+                "o" => nodes.insert(
+                    id,
+                    NNFNode::Or {
                         id,
-                        NNFNode::Or {
-                            id,
-                            children: vec![],
-                            entailed: vec![],
-                        },
-                    );
-                }
-                "a" => {
-                    nodes.insert(
+                        children: vec![],
+                        entailed: vec![],
+                    },
+                ),
+                "a" => nodes.insert(
+                    id,
+                    NNFNode::And {
                         id,
-                        NNFNode::And {
-                            id,
-                            children: vec![],
-                            entailed: vec![],
-                            lits,
-                        },
-                    );
-                }
-                "t" => {
-                    nodes.insert(id, NNFNode::True(id));
-                }
-                "f" => {
-                    nodes.insert(id, NNFNode::False(id));
-                }
-
+                        children: vec![],
+                        entailed: vec![],
+                        lits,
+                    },
+                ),
+                "t" => nodes.insert(id, NNFNode::True(id)),
+                "f" => nodes.insert(id, NNFNode::False(id)),
                 // no node, but an arc
                 _ => {
                     let origin = t.parse::<NodeIndex>().unwrap();
                     arcs.push((origin, id, lits));
+                    continue;
                 }
             };
         }
@@ -381,8 +478,32 @@ impl NNFTree {
             }
         }
 
+        let root = 1;
+
+        // make sure the root node is a valid decision node
+        if let [ref child] = nodes.get(&root).unwrap().children() {
+            max_id += 1;
+            let tf = NNFNode::False(max_id);
+            max_id += 1;
+            let root_lit = if let Some(NNFNode::And { ref lits, .. }) = nodes.get(child) {
+                lits[0]
+            } else {
+                panic! {"root is not a decision node!"};
+            };
+            let otherbranch = NNFNode::And {
+                id: max_id,
+                children: vec![tf.id()],
+                lits: vec![-root_lit],
+                entailed: vec![],
+            };
+            nodes.get_mut(&root).unwrap().add_child(otherbranch.id());
+            nodes.insert(tf.id(), tf);
+            nodes.insert(otherbranch.id(), otherbranch);
+        }
+
         NNFTree {
-            root: 1,
+            root,
+            clauses,
             nodes,
             max_id,
         }
@@ -410,7 +531,7 @@ impl CNFFormula {
             }
 
             // problem line
-            if line.starts_with("p") {
+            if line.starts_with('p') {
                 let mut split = line.split_whitespace();
                 assert!(split.next() == Some("p"));
                 assert!(split.next() == Some("cnf"));
@@ -455,15 +576,25 @@ fn main() -> std::io::Result<()> {
             .map(|l| l.unwrap()),
     );
     let mut nnf = NNFTree::parse(
+        formula.clauses.clone(),
         BufReader::new(File::open(args.nnf)?)
             .lines()
             .map(|l| l.unwrap()),
     );
 
-    //nnf.print_formula(nnf.root, 0);
     let clause_indices: Vec<_> = formula.clauses.iter().enumerate().map(|(i, _)| i).collect();
-    nnf.entailment_annotate(nnf.root, &clause_indices, &formula.clauses);
-    println!("Hello, world!");
+    eprintln!("annotating...");
+    nnf.entailment_annotate(nnf.root, &clause_indices);
+    eprintln!("smoothing...");
+    let nnf_vars = nnf.varsof(nnf.root);
+    let missing = (1..=formula.vars)
+        .map(|v| v as Var)
+        .filter(|v| !nnf_vars.contains(v))
+        .collect();
+    println!("missing vars: {:?}", missing);
+    nnf.smooth(missing);
+
+    //nnf.print_formula(nnf.root, 0);
     eprintln! {"{:?}", formula};
     eprintln! {"{:?}", nnf.varsof(nnf.root)};
 
