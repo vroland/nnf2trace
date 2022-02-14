@@ -12,7 +12,7 @@ type ComponentId = usize;
 type Lit = i64;
 type Var = i64;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 enum NNFNode {
     Or {
         id: NodeIndex,
@@ -93,7 +93,7 @@ impl NNFNode {
 #[derive(Debug)]
 struct NNFTree {
     root: NodeIndex,
-    nodes: HashMap<NodeIndex, NNFNode>,
+    nodes: Vec<NNFNode>,
     max_id: usize,
     clauses: Vec<Vec<Lit>>,
 }
@@ -104,12 +104,19 @@ impl NNFTree {
         self.max_id
     }
 
+    fn add_node(&mut self, node: NNFNode) {
+        if !self.nodes.len() == node.id() {
+            panic! {"unordered node insert!"}
+        }
+        self.nodes.push(node);
+    }
+
     fn children_recursive(&self, node: NodeIndex) -> Vec<NodeIndex> {
         let mut stack = vec![node];
         let mut visited = vec![];
         while let Some(n) = stack.pop() {
             visited.push(n);
-            stack.extend_from_slice(self.nodes.get(&n).unwrap().children());
+            stack.extend_from_slice(self.nodes[n].children());
         }
         visited
     }
@@ -118,7 +125,7 @@ impl NNFTree {
         let mut vars = BTreeSet::new();
         let nodes = self.children_recursive(node);
         for n in nodes {
-            match self.nodes.get(&n).unwrap() {
+            match &self.nodes[n] {
                 NNFNode::And { ref lits, .. } => vars.extend(lits.iter().map(|l| l.abs())),
                 NNFNode::Or { .. } | NNFNode::False(_) => (),
             }
@@ -128,7 +135,7 @@ impl NNFTree {
 
     fn clone_subtree(&mut self, node: NodeIndex) -> NodeIndex {
         let new_id = self.issue_new_id();
-        match self.nodes.get(&node).unwrap() {
+        match &self.nodes[node] {
             NNFNode::And {
                 id: _,
                 ref children,
@@ -145,7 +152,7 @@ impl NNFTree {
                         .collect(),
                     entailed: vec![],
                 };
-                self.nodes.insert(new_id, new_node);
+                self.add_node(new_node);
                 new_id
             }
             NNFNode::Or {
@@ -162,7 +169,7 @@ impl NNFTree {
                         .map(|c| self.clone_subtree(c))
                         .collect(),
                 };
-                self.nodes.insert(new_id, new_node);
+                self.add_node(new_node);
                 new_id
             }
             NNFNode::False(id) => *id,
@@ -170,7 +177,7 @@ impl NNFTree {
     }
 
     pub fn print_formula(&self, node: NodeIndex, depth: usize) {
-        match self.nodes.get(&node).unwrap() {
+        match &self.nodes[node] {
             NNFNode::False(id) => println! {"{}{}: F", "  ".repeat(depth), id},
             NNFNode::And {
                 id,
@@ -195,7 +202,7 @@ impl NNFTree {
     }
 
     fn satisfiable(&self, node: NodeIndex, assumption: &[Lit]) -> bool {
-        match self.nodes.get(&node).unwrap() {
+        match self.nodes[node] {
             NNFNode::False(_) => false,
             NNFNode::And {
                 ref children,
@@ -225,7 +232,7 @@ impl NNFTree {
         smooth_nodes: &HashMap<Var, NodeIndex>,
         missing: &BTreeSet<Var>,
     ) {
-        match self.nodes.get(&node).unwrap() {
+        match self.nodes[node] {
             NNFNode::And { ref children, .. } => {
                 let mut partition: Vec<BTreeSet<Var>> =
                     children.iter().map(|_c| BTreeSet::new()).collect();
@@ -234,7 +241,7 @@ impl NNFTree {
                 // We assume assigned variables for each child are non-overlapping,
                 // as explained in the paper.
                 for (i, child) in children.iter().enumerate() {
-                    for cl in self.nodes.get(child).unwrap().entailed() {
+                    for cl in self.nodes[*child].entailed() {
                         for var in self.clauses[*cl].iter().map(|l| l.abs()) {
                             if missing.contains(&var) {
                                 partition[i].insert(var);
@@ -252,7 +259,7 @@ impl NNFTree {
                 // is this a conflict node?
                 let conflict = children
                     .iter()
-                    .any(|c| matches! {self.nodes.get(c), Some(NNFNode::False(_))});
+                    .any(|c| matches! {self.nodes[*c], NNFNode::False(_)});
 
                 if !conflict {
                     let original_children = children.clone();
@@ -263,7 +270,7 @@ impl NNFTree {
                     for var in introduce {
                         let smooth_id = smooth_nodes.get(var).unwrap();
                         if !original_children.contains(smooth_id) {
-                            self.nodes.get_mut(&node).unwrap().add_child(*smooth_id)
+                            self.nodes[node].add_child(*smooth_id)
                         }
                     }
                 }
@@ -309,10 +316,10 @@ impl NNFTree {
                 children: vec![child1.id(), child2.id()],
                 entailed: vec![],
             };
-            self.nodes.insert(child1.id(), child1);
-            self.nodes.insert(child2.id(), child2);
             varnode_map.insert(v, varnode.id());
-            self.nodes.insert(varnode.id(), varnode);
+            self.add_node(child1);
+            self.add_node(child2);
+            self.add_node(varnode);
         }
         self.smooth_recurse(self.root, &varnode_map, &missing);
     }
@@ -320,7 +327,7 @@ impl NNFTree {
     pub fn entailment_annotate(&mut self, node: NodeIndex, clauses: &[ClauseIndex]) {
         let mut entailed_here = vec![];
 
-        match self.nodes.get(&node).unwrap() {
+        match &self.nodes[node] {
             NNFNode::And {
                 ref children,
                 ref lits,
@@ -340,7 +347,7 @@ impl NNFTree {
                 // annotate children
                 for (i, child) in children.clone().into_iter().enumerate() {
                     if let NNFNode::And { ref entailed, .. } | NNFNode::Or { ref entailed, .. } =
-                        self.nodes.get(&child).unwrap()
+                        &self.nodes[child]
                     {
                         // this node was already encountered, do we
                         // need a clone?
@@ -355,7 +362,7 @@ impl NNFTree {
                             if entailed != &child_entails {
                                 let new_child = self.clone_subtree(child);
                                 eprintln! {"cloning {} to {}", child, new_child}
-                                self.nodes.get_mut(&node).unwrap().children_mut()[i] = child;
+                                self.nodes[node].children_mut()[i] = child;
                                 self.entailment_annotate(new_child, &child_entails);
                             } else {
                                 continue;
@@ -391,14 +398,11 @@ impl NNFTree {
             NNFNode::False(_) => return,
         }
 
-        self.nodes
-            .get_mut(&node)
-            .unwrap()
-            .set_entailed_clauses(&entailed_here[..]);
+        self.nodes[node].set_entailed_clauses(&entailed_here[..]);
     }
 
     pub fn parse(clauses: Vec<Vec<Lit>>, lines: impl Iterator<Item = String>) -> Self {
-        let mut nodes = HashMap::new();
+        let mut nodes = vec![NNFNode::False(0)];
         let mut arcs = vec![];
         let mut max_id = 0;
 
@@ -422,31 +426,30 @@ impl NNFTree {
             // line is 0-termianted
             assert!(lits.pop() == Some(0));
 
-            max_id = max_id.max(id);
+            // we have a new node with a larger ID
+            if id > max_id && ["o", "a", "f"].contains(&t) {
+                nodes.resize(id + 1, nodes[0].clone());
+                max_id = id;
+            }
 
-            match t {
-                "o" => nodes.insert(
+            // slot not yet filled
+            nodes[id] = match t {
+                "o" => NNFNode::Or {
                     id,
-                    NNFNode::Or {
-                        id,
-                        children: vec![],
-                        entailed: vec![],
-                    },
-                ),
-                "a" => nodes.insert(
+                    children: vec![],
+                    entailed: vec![],
+                },
+                "a" => NNFNode::And {
                     id,
-                    NNFNode::And {
-                        id,
-                        children: vec![],
-                        entailed: vec![],
-                        lits,
-                    },
-                ),
+                    children: vec![],
+                    entailed: vec![],
+                    lits,
+                },
+                "f" => NNFNode::False(id),
                 "t" => {
                     true_nodes.push(id);
-                    None
+                    continue;
                 }
-                "f" => nodes.insert(id, NNFNode::False(id)),
                 // no node, but an arc
                 _ => {
                     let origin = t.parse::<NodeIndex>().unwrap();
@@ -474,22 +477,23 @@ impl NNFTree {
                     entailed: vec![],
                     lits,
                 };
-                nodes.insert(id, new_node);
-                nodes.get_mut(&origin).unwrap().add_child(id);
+                assert! {nodes.len() == new_node.id()}
+                nodes.push(new_node);
+                nodes[origin].add_child(id);
             } else {
                 assert! {!true_nodes.contains(&target)};
-                nodes.get_mut(&origin).unwrap().add_child(target);
+                nodes[origin].add_child(target);
             }
         }
 
         let root = 1;
 
         // make sure the root node is a valid decision node
-        if let [ref child] = nodes.get(&root).unwrap().children() {
+        if let [ref child] = nodes[root].children() {
             max_id += 1;
             let tf = NNFNode::False(max_id);
             max_id += 1;
-            let root_lit = if let Some(NNFNode::And { ref lits, .. }) = nodes.get(child) {
+            let root_lit = if let NNFNode::And { ref lits, .. } = &nodes[*child] {
                 lits[0]
             } else {
                 panic! {"root is not a decision node!"};
@@ -500,9 +504,12 @@ impl NNFTree {
                 lits: vec![-root_lit],
                 entailed: vec![],
             };
-            nodes.get_mut(&root).unwrap().add_child(otherbranch.id());
-            nodes.insert(tf.id(), tf);
-            nodes.insert(otherbranch.id(), otherbranch);
+
+            nodes[root].add_child(otherbranch.id());
+            assert! {nodes.len() == tf.id()}
+            nodes.push(tf);
+            assert! {nodes.len() == otherbranch.id()}
+            nodes.push(otherbranch);
         }
 
         NNFTree {
@@ -611,7 +618,7 @@ impl<'l> NNFTracer<'l> {
         parent_comp: ComponentId,
     ) -> BigUint {
         let vars = self.nnf.varsof(node);
-        match self.nnf.nodes.get(&node).unwrap() {
+        match &self.nnf.nodes[node] {
             NNFNode::And {
                 id,
                 children,
@@ -688,7 +695,7 @@ impl<'l> NNFTracer<'l> {
                     _ => panic! {"decision node must have tow children!"},
                 };
 
-                let dec_lit = match self.nnf.nodes.get(&child1).unwrap() {
+                let dec_lit = match &self.nnf.nodes[child1] {
                     NNFNode::And { lits, .. } => lits[0],
                     _ => panic! {"children of decision nodes must be AND nodes!"},
                 };
@@ -709,7 +716,7 @@ impl<'l> NNFTracer<'l> {
             }
             NNFNode::False(_) => {
                 let compid = self.issue_comp_id();
-                let parent_clauses = self.nnf.nodes.get(&parent).unwrap().entailed();
+                let parent_clauses = self.nnf.nodes[parent].entailed();
 
                 println!("c UNSAT component for {}", compid);
                 Self::trace_comp(compid, parent_comp, vars.iter(), parent_clauses);
