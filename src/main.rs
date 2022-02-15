@@ -1,10 +1,11 @@
 use clap::Parser;
 use num_bigint::BigUint;
 use num_traits::identities::{One, Zero};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 type NodeIndex = usize;
 type ClauseIndex = usize;
@@ -105,7 +106,7 @@ impl NNFTree {
     }
 
     fn add_node(&mut self, node: NNFNode) {
-        if !self.nodes.len() == node.id() {
+        if self.nodes.len() != node.id() {
             panic! {"unordered node insert!"}
         }
         self.nodes.push(node);
@@ -138,13 +139,12 @@ impl NNFTree {
         vars_map
             .iter()
             .enumerate()
-            .filter(|(i, present)| **present)
+            .filter(|(_i, present)| **present)
             .map(|(i, _)| i as Var)
             .collect()
     }
 
     fn clone_subtree(&mut self, node: NodeIndex) -> NodeIndex {
-        let new_id = self.issue_new_id();
         match &self.nodes[node] {
             NNFNode::And {
                 id: _,
@@ -152,17 +152,20 @@ impl NNFTree {
                 ref lits,
                 ..
             } => {
+                let orig_children = children.clone();
+                let lits = lits.clone();
+                let new_id = self.issue_new_id();
                 let new_node = NNFNode::And {
                     id: new_id,
-                    lits: lits.clone(),
-                    children: children
-                        .clone()
-                        .drain(..)
-                        .map(|c| self.clone_subtree(c))
-                        .collect(),
+                    lits,
+                    children: vec![],
                     entailed: vec![],
                 };
                 self.add_node(new_node);
+                for child in orig_children {
+                    let cid = self.clone_subtree(child);
+                    self.nodes[new_id].add_child(cid);
+                }
                 new_id
             }
             NNFNode::Or {
@@ -170,16 +173,18 @@ impl NNFTree {
                 ref children,
                 ..
             } => {
+                let orig_children = children.clone();
+                let new_id = self.issue_new_id();
                 let new_node = NNFNode::Or {
                     id: new_id,
                     entailed: vec![],
-                    children: children
-                        .clone()
-                        .drain(..)
-                        .map(|c| self.clone_subtree(c))
-                        .collect(),
+                    children: vec![],
                 };
                 self.add_node(new_node);
+                for child in orig_children {
+                    let cid = self.clone_subtree(child);
+                    self.nodes[new_id].add_child(cid);
+                }
                 new_id
             }
             NNFNode::False(id) => *id,
@@ -306,8 +311,8 @@ impl NNFTree {
                         .copied()
                         .filter(|v1| c2v.binary_search(v1).is_err())
                         .collect();
-                    c1m.extend_from_slice(&missing[..]);
-                    c2m.extend_from_slice(&missing[..]);
+                    c1m.extend_from_slice(missing);
+                    c2m.extend_from_slice(missing);
                     c1m.sort_unstable();
                     c2m.sort_unstable();
                     c1m.dedup();
@@ -349,7 +354,7 @@ impl NNFTree {
             self.add_node(child2);
             self.add_node(varnode);
         }
-        self.smooth_recurse(self.root, &varnode_map, &missing);
+        self.smooth_recurse(self.root, &varnode_map, missing);
     }
 
     pub fn entailment_annotate(&mut self, node: NodeIndex, clauses: &[ClauseIndex]) {
@@ -390,8 +395,10 @@ impl NNFTree {
                             if entailed != &child_entails {
                                 let new_child = self.clone_subtree(child);
                                 eprintln! {"cloning {} to {}", child, new_child}
-                                self.nodes[node].children_mut()[i] = child;
+                                //self.print_formula(child, 0);
+                                //self.print_formula(new_child, 0);
                                 self.entailment_annotate(new_child, &child_entails);
+                                self.nodes[node].children_mut()[i] = new_child;
                             } else {
                                 continue;
                             }
@@ -590,7 +597,8 @@ impl CNFFormula {
             }
         }
         if expected_clauses != formula.clauses.len() {
-            panic! {"wrong number of clauses specified in CNF!"};
+            panic! {"wrong number of clauses specified in CNF: {} vs {}!",
+            formula.clauses.len(), expected_clauses};
         }
         formula
     }
@@ -639,6 +647,63 @@ impl<'l> NNFTracer<'l> {
         }
     }
 
+    fn trace_proof(
+        &self,
+        proof_id: ComponentId,
+        vars: &[Var],
+        clauses: &[ClauseIndex],
+        bcp_assignment: &[Lit],
+        declit: Lit,
+    ) {
+        let mut problem_string =
+            format! {"p cnf {} {}", vars.iter().max().unwrap(), clauses.len() + 2};
+
+        for cl in clauses {
+            problem_string += Self::lstr(
+                self.nnf.clauses[*cl]
+                    .iter()
+                    .filter(|l| vars.binary_search(&l.abs()).is_ok()),
+            )
+            .as_str();
+            problem_string += " 0\n";
+        }
+
+        problem_string += Self::lstr(bcp_assignment.iter().map(|l| -l)).as_str();
+        problem_string += " 0\n";
+        problem_string += format! {"{} 0\n", declit}.as_str();
+
+        let mut child = Command::new("./minisat")
+            .arg("-verb=0")
+            .arg("/dev/stdin")
+            .arg("/dev/stderr")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run minisat!");
+        BufWriter::new(child.stdin.take().unwrap())
+            .write_all(problem_string.as_bytes())
+            .expect("could not write to minisat!");
+        let output = child
+            .wait_with_output()
+            .expect("could not collect minisat output!");
+
+        let out = String::from_utf8(output.stdout).unwrap();
+        let err = String::from_utf8(output.stderr).unwrap();
+
+        if !out.trim().ends_with("UNSATISFIABLE") {
+            panic! {"problem is satisfiable: {}\nstdout:\n{}\nstderr:\n{}",
+            problem_string, out, err};
+        }
+
+        for line in err
+            .lines()
+            .filter(|line| !line.starts_with('d') && line.ends_with('0'))
+        {
+            println!("xs {} {}", proof_id, line);
+        }
+    }
+
     fn trace_recurse(
         &mut self,
         node: NodeIndex,
@@ -662,29 +727,28 @@ impl<'l> NNFTracer<'l> {
 
                 // trace a new join component
                 println!("c AND component for {} {:?}", id, lits);
-                let join_vars = vars.iter().filter(|v| litvars.binary_search(&v).is_err());
+                let join_vars = vars.iter().filter(|v| !litvars.contains(v));
                 Self::trace_comp(join_comp, parent_comp, join_vars, entailed);
 
                 // leaf node
                 let count = if children.is_empty() {
-                    println!("m {} 1 {} 0", parent_comp, Self::lstr(litvars.iter()));
+                    println!("m {} 1 {} 0", parent_comp, Self::lstr(lits.iter()));
                     BigUint::one()
                 // join children
                 } else {
-                    children
+                    let count = children
                         .iter()
                         .map(|child| self.trace_recurse(*child, node, join_comp))
-                        .fold(BigUint::one(), |acc, c| acc * c)
+                        .fold(BigUint::one(), |acc, c| acc * c);
+                    println!("j {join_comp} {count} 0");
+                    count
                 };
 
                 if !lits.is_empty() {
                     // extend to parent component
                     if !children.is_empty() {
                         println!(
-                            "e {} {} {} {} 0",
-                            parent_comp,
-                            join_comp,
-                            count,
+                            "e {parent_comp} {join_comp} {count} {} 0",
                             Self::lstr(lits.iter())
                         );
                     }
@@ -694,14 +758,19 @@ impl<'l> NNFTracer<'l> {
                         let dec_lit = lits[0];
                         println!("xp {} {} 0", join_comp, parent_comp);
 
-                        // FIXME: proof
-                        println!(
-                            "xf {} {} 0 {} 0",
+                        self.trace_proof(
                             join_comp,
-                            Self::lstr(litvars.iter()),
-                            dec_lit
+                            &vars,
+                            self.nnf.nodes[parent].entailed(),
+                            lits,
+                            dec_lit,
                         );
-                        println!("a {} {} {} 0", join_comp, count, dec_lit);
+
+                        println!(
+                            "xf {join_comp} {} 0 {dec_lit} 0",
+                            Self::lstr(litvars.iter()),
+                        );
+                        println!("a {join_comp} {count} {dec_lit} 0");
                     }
                 }
 
@@ -714,7 +783,7 @@ impl<'l> NNFTracer<'l> {
             } => {
                 // node is already exported
                 if let Some((comp, count)) = self.exported_nodes.get(id) {
-                    println!("jc {} {}", comp, parent_comp);
+                    println!("jc {} {} 0", comp, parent_comp);
                     return count.clone();
                 }
 
@@ -785,20 +854,26 @@ fn main() -> std::io::Result<()> {
             .map(|l| l.unwrap()),
     );
 
-    let clause_indices: Vec<_> = formula.clauses.iter().enumerate().map(|(i, _)| i).collect();
+    println!("p st {} {} 0", formula.vars, formula.clauses.len());
+    for (i, clause) in formula.clauses.iter().enumerate() {
+        println!("f {} {} 0", i + 1, NNFTracer::lstr(clause.iter()));
+    }
+
     eprintln!("annotating...");
+    let clause_indices: Vec<_> = formula.clauses.iter().enumerate().map(|(i, _)| i).collect();
     nnf.entailment_annotate(nnf.root, &clause_indices);
+
     eprintln!("smoothing...");
     let nnf_vars = nnf.varsof(nnf.root);
     let missing: Vec<_> = (1..=formula.vars)
         .map(|v| v as Var)
         .filter(|v| !nnf_vars.contains(v))
         .collect();
-    println!("missing vars: {:?}", missing);
     nnf.smooth(&missing);
 
     //nnf.print_formula(nnf.root, 0);
 
+    eprintln!("tracing...");
     NNFTracer::trace(&nnf);
 
     Ok(())
