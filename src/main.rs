@@ -121,16 +121,26 @@ impl NNFTree {
         visited
     }
 
-    pub fn varsof(&self, node: NodeIndex) -> BTreeSet<Var> {
-        let mut vars = BTreeSet::new();
+    pub fn varsof(&self, node: NodeIndex) -> Vec<Var> {
         let nodes = self.children_recursive(node);
+        let mut vars_map = vec![false];
         for n in nodes {
-            match &self.nodes[n] {
-                NNFNode::And { ref lits, .. } => vars.extend(lits.iter().map(|l| l.abs())),
-                NNFNode::Or { .. } | NNFNode::False(_) => (),
+            if let NNFNode::And { ref lits, .. } = &self.nodes[n] {
+                for l in lits {
+                    let var = l.abs() as usize;
+                    if var >= vars_map.len() {
+                        vars_map.resize(var + 1, false);
+                    }
+                    vars_map[var] = true;
+                }
             }
         }
-        vars
+        vars_map
+            .iter()
+            .enumerate()
+            .filter(|(i, present)| **present)
+            .map(|(i, _)| i as Var)
+            .collect()
     }
 
     fn clone_subtree(&mut self, node: NodeIndex) -> NodeIndex {
@@ -226,16 +236,16 @@ impl NNFTree {
         !self.satisfiable(node, &negated)
     }
 
+    // Invariant: `missing` is sorted
     fn smooth_recurse(
         &mut self,
         node: NodeIndex,
         smooth_nodes: &HashMap<Var, NodeIndex>,
-        missing: &BTreeSet<Var>,
+        missing: &[Var],
     ) {
         match self.nodes[node] {
             NNFNode::And { ref children, .. } => {
-                let mut partition: Vec<BTreeSet<Var>> =
-                    children.iter().map(|_c| BTreeSet::new()).collect();
+                let mut partition: Vec<Vec<Var>> = children.iter().map(|_c| vec![]).collect();
 
                 // Partition missing variables according to children.
                 // We assume assigned variables for each child are non-overlapping,
@@ -243,11 +253,15 @@ impl NNFTree {
                 for (i, child) in children.iter().enumerate() {
                     for cl in self.nodes[*child].entailed() {
                         for var in self.clauses[*cl].iter().map(|l| l.abs()) {
-                            if missing.contains(&var) {
-                                partition[i].insert(var);
+                            if missing.binary_search(&var).is_ok() {
+                                partition[i].push(var);
                             }
                         }
                     }
+                }
+
+                for part in partition.iter_mut() {
+                    part.sort_unstable();
                 }
 
                 // variables to introduce now
@@ -282,10 +296,23 @@ impl NNFTree {
                     let c1v = self.varsof(*child1);
                     let c2v = self.varsof(*child2);
 
-                    let mut c1m: BTreeSet<Var> = c2v.difference(&c1v).copied().collect();
-                    let mut c2m: BTreeSet<Var> = c1v.difference(&c2v).copied().collect();
-                    c1m.extend(missing);
-                    c2m.extend(missing);
+                    let mut c1m: Vec<_> = c2v
+                        .iter()
+                        .copied()
+                        .filter(|v2| c1v.binary_search(v2).is_err())
+                        .collect();
+                    let mut c2m: Vec<_> = c1v
+                        .iter()
+                        .copied()
+                        .filter(|v1| c2v.binary_search(v1).is_err())
+                        .collect();
+                    c1m.extend_from_slice(&missing[..]);
+                    c2m.extend_from_slice(&missing[..]);
+                    c1m.sort_unstable();
+                    c2m.sort_unstable();
+                    c1m.dedup();
+                    c2m.dedup();
+
                     self.smooth_recurse(cid1, smooth_nodes, &c1m);
                     self.smooth_recurse(cid2, smooth_nodes, &c2m);
                 } else {
@@ -296,7 +323,8 @@ impl NNFTree {
         }
     }
 
-    pub fn smooth(&mut self, missing: BTreeSet<Var>) {
+    // `missing`: *Sorted* vec of missing variables.
+    pub fn smooth(&mut self, missing: &[Var]) {
         let mut varnode_map = HashMap::new();
         for v in missing.iter().chain(self.varsof(self.root).iter()).copied() {
             let child1 = NNFNode::And {
@@ -628,13 +656,14 @@ impl<'l> NNFTracer<'l> {
                 // we export AND-nodes uniquely.
                 assert! {!self.exported_nodes.contains_key(id)};
 
-                let litvars: BTreeSet<_> = lits.iter().map(|l| l.abs()).collect();
+                let litvars: Vec<_> = lits.iter().map(|l| l.abs()).collect();
 
                 let join_comp = self.issue_comp_id();
 
                 // trace a new join component
                 println!("c AND component for {} {:?}", id, lits);
-                Self::trace_comp(join_comp, parent_comp, vars.difference(&litvars), entailed);
+                let join_vars = vars.iter().filter(|v| litvars.binary_search(&v).is_err());
+                Self::trace_comp(join_comp, parent_comp, join_vars, entailed);
 
                 // leaf node
                 let count = if children.is_empty() {
@@ -761,12 +790,12 @@ fn main() -> std::io::Result<()> {
     nnf.entailment_annotate(nnf.root, &clause_indices);
     eprintln!("smoothing...");
     let nnf_vars = nnf.varsof(nnf.root);
-    let missing = (1..=formula.vars)
+    let missing: Vec<_> = (1..=formula.vars)
         .map(|v| v as Var)
         .filter(|v| !nnf_vars.contains(v))
         .collect();
     println!("missing vars: {:?}", missing);
-    nnf.smooth(missing);
+    nnf.smooth(&missing);
 
     //nnf.print_formula(nnf.root, 0);
 
