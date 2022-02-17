@@ -446,7 +446,7 @@ impl NNFTree {
 
         // read lines
         for line in lines {
-            if line.trim().is_empty() {
+            if line.trim().is_empty() || line.starts_with('c') || line.starts_with('s') {
                 continue;
             }
 
@@ -572,7 +572,7 @@ impl CNFFormula {
         let mut expected_clauses = 0;
 
         for line in lines {
-            if line.trim().is_empty() {
+            if line.trim().is_empty() || line.starts_with('c') || line.starts_with('w') {
                 continue;
             }
 
@@ -656,7 +656,7 @@ impl<'l> NNFTracer<'l> {
         declit: Lit,
     ) {
         let mut problem_string =
-            format! {"p cnf {} {}", vars.iter().max().unwrap(), clauses.len() + 2};
+            format! {"p cnf {} {}\n", vars.iter().max().unwrap(), clauses.len() + 2};
 
         for cl in clauses {
             problem_string += Self::lstr(
@@ -863,6 +863,8 @@ fn main() -> std::io::Result<()> {
     let clause_indices: Vec<_> = formula.clauses.iter().enumerate().map(|(i, _)| i).collect();
     nnf.entailment_annotate(nnf.root, &clause_indices);
 
+    //nnf.print_formula(nnf.root, 0);
+
     eprintln!("smoothing...");
     let nnf_vars = nnf.varsof(nnf.root);
     let missing: Vec<_> = (1..=formula.vars)
@@ -870,8 +872,6 @@ fn main() -> std::io::Result<()> {
         .filter(|v| !nnf_vars.contains(v))
         .collect();
     nnf.smooth(&missing);
-
-    //nnf.print_formula(nnf.root, 0);
 
     eprintln!("tracing...");
     NNFTracer::trace(&nnf);
