@@ -521,30 +521,33 @@ impl NNFTree {
             }
         }
 
-        let root = 1;
+        let mut root = 1;
 
         // make sure the root node is a valid decision node
         if let [ref child] = nodes[root].children() {
             max_id += 1;
-            let tf = NNFNode::False(max_id);
-            max_id += 1;
-            let root_lit = if let NNFNode::And { ref lits, .. } = &nodes[*child] {
-                lits[0]
+            let tfid = max_id;
+            let tf = NNFNode::False(tfid);
+            if let NNFNode::And { ref lits, .. } = &nodes[*child] {
+                max_id += 1;
+                let otherbranch = NNFNode::And {
+                    id: max_id,
+                    children: vec![tfid],
+                    lits: vec![-lits[0]],
+                    entailed: vec![],
+                };
+                assert! {nodes.len() == tf.id()}
+                nodes.push(tf);
+                nodes[root].add_child(otherbranch.id());
+                assert! {nodes.len() == otherbranch.id()}
+                nodes.push(otherbranch);
+            } else if nodes[*child].children().len() == 2 {
+                eprintln! {"changing root node to {}", child};
+                max_id -= 1;
+                root = *child;
             } else {
                 panic! {"root is not a decision node!"};
             };
-            let otherbranch = NNFNode::And {
-                id: max_id,
-                children: vec![tf.id()],
-                lits: vec![-root_lit],
-                entailed: vec![],
-            };
-
-            nodes[root].add_child(otherbranch.id());
-            assert! {nodes.len() == tf.id()}
-            nodes.push(tf);
-            assert! {nodes.len() == otherbranch.id()}
-            nodes.push(otherbranch);
         }
 
         NNFTree {
