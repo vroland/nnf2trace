@@ -759,7 +759,7 @@ impl<'l> NNFTracer<'l> {
                     // we have to project-away assumption literals
                     if lits.len() > 1 {
                         let dec_lit = lits[0];
-                        println!("xp {} {} 0", join_comp, parent_comp);
+                        println!("xp {} 0", join_comp);
 
                         self.trace_proof(
                             join_comp,
@@ -770,10 +770,10 @@ impl<'l> NNFTracer<'l> {
                         );
 
                         println!(
-                            "xf {join_comp} {} 0 {dec_lit} 0",
+                            "xf {join_comp} {parent_comp} {} 0 {dec_lit} 0",
                             Self::lstr(litvars.iter()),
                         );
-                        println!("a {join_comp} {count} {dec_lit} 0");
+                        println!("a {parent_comp} {join_comp} {count} {dec_lit} 0");
                     }
                 }
 
@@ -808,9 +808,9 @@ impl<'l> NNFTracer<'l> {
                 let c2 = self.trace_recurse(child2, node, compid);
                 let count = c1 + c2;
 
-                println!("xp {} {} 0", compid, compid);
-                println!("xf {} {} 0 0", compid, dec_lit.abs());
-                println!("a {} {} 0", compid, count);
+                println!("xp {compid} 0");
+                println!("xf {compid} {compid} {} 0 0", dec_lit.abs());
+                println!("a {compid} {compid} {count} 0");
 
                 self.exported_nodes.insert(node, (compid, count.clone()));
                 count
@@ -822,9 +822,9 @@ impl<'l> NNFTracer<'l> {
                 println!("c UNSAT component for {}", compid);
                 Self::trace_comp(compid, parent_comp, vars.iter(), parent_clauses);
 
-                println!("xp {} {} 0", compid, compid);
-                println!("xf {} 0 0", compid);
-                println!("a {} 0 0", compid);
+                println!("xp {compid} 0");
+                println!("xf {compid} {compid} 0 0");
+                println!("a {compid} {compid} 0 0");
 
                 BigUint::zero()
             }
