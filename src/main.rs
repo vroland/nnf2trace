@@ -321,7 +321,7 @@ impl NNFTree {
                     self.smooth_recurse(cid1, smooth_nodes, &c1m);
                     self.smooth_recurse(cid2, smooth_nodes, &c2m);
                 } else {
-                    panic! {"a decision node must have exactly two children!"};
+                    panic! {"a decision node must have exactly two children but has {}!", children.len()};
                 }
             }
             NNFNode::False(_) => (),
@@ -518,6 +518,26 @@ impl NNFTree {
             } else {
                 assert! {!true_nodes.contains(&target)};
                 nodes[origin].add_child(target);
+            }
+        }
+
+        // convert single-child or nodes to AND nodes
+        for node in &mut nodes {
+            if let NNFNode::Or {
+                id,
+                children,
+                entailed,
+            } = node
+            {
+                if children.len() == 1 {
+                    let new_node = NNFNode::And {
+                        id: *id,
+                        children: children.clone(),
+                        entailed: entailed.clone(),
+                        lits: vec![],
+                    };
+                    let _ = std::mem::replace(node, new_node);
+                }
             }
         }
 
