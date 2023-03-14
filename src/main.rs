@@ -555,14 +555,10 @@ impl NNFTree {
 
         // make sure the root node is a valid decision node
         if let [ref child] = nodes[root].children() {
-            max_id += 1;
-            let tfid = max_id;
-            let tf = NNFNode::False(tfid);
-            if let NNFNode::And { ref lits, .. } = &nodes[*child] {
+            if let NNFNode::And { .. } = &nodes[*child] {
                 panic!("this should have been handled before!");
             } else if nodes[*child].children().len() == 2 {
                 eprintln! {"changing root node to {}", child};
-                max_id -= 1;
                 root = *child;
             } else {
                 panic! {"root is not a decision node!"};
