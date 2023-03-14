@@ -295,8 +295,8 @@ impl NNFTree {
                 }
             }
 
-            NNFNode::Or { ref children, .. } => {
-                if let [child1, child2] = &children[..] {
+            NNFNode::Or { ref children, .. } => match &children[..] {
+                [child1, child2] => {
                     let (cid1, cid2) = (*child1, *child2);
                     let c1v = self.varsof(*child1);
                     let c2v = self.varsof(*child2);
@@ -320,10 +320,11 @@ impl NNFTree {
 
                     self.smooth_recurse(cid1, smooth_nodes, &c1m);
                     self.smooth_recurse(cid2, smooth_nodes, &c2m);
-                } else {
-                    panic! {"a decision node must have exactly two children but has {}!", children.len()};
                 }
-            }
+                _ => {
+                    panic! {"a decision node must have exactly two children but has {}!", children.len()}
+                }
+            },
             NNFNode::False(_) => (),
         }
     }
@@ -522,21 +523,30 @@ impl NNFTree {
         }
 
         // convert single-child or nodes to AND nodes
-        for node in &mut nodes {
-            if let NNFNode::Or {
-                id,
-                children,
-                entailed,
-            } = node
-            {
-                if children.len() == 1 {
-                    let new_node = NNFNode::And {
-                        id: *id,
-                        children: children.clone(),
-                        entailed: entailed.clone(),
-                        lits: vec![],
+        for node in &nodes.clone() {
+            if let NNFNode::Or { id, children, .. } = node {
+                let [child] = children[..] else {
+                    continue;
+                };
+
+                // reconstruct implicit decision branches
+                if let NNFNode::And { ref lits, .. } = nodes[child] {
+                    eprintln!("single child: {id:?}");
+                    max_id += 1;
+                    let tfid = max_id;
+                    let tf = NNFNode::False(tfid);
+                    max_id += 1;
+                    let otherbranch = NNFNode::And {
+                        id: max_id,
+                        children: vec![tfid],
+                        lits: vec![-lits[0]],
+                        entailed: vec![],
                     };
-                    let _ = std::mem::replace(node, new_node);
+                    assert! {nodes.len() == tf.id()}
+                    nodes.push(tf);
+                    nodes[*id].add_child(otherbranch.id());
+                    assert! {nodes.len() == otherbranch.id()}
+                    nodes.push(otherbranch);
                 }
             }
         }
@@ -549,18 +559,7 @@ impl NNFTree {
             let tfid = max_id;
             let tf = NNFNode::False(tfid);
             if let NNFNode::And { ref lits, .. } = &nodes[*child] {
-                max_id += 1;
-                let otherbranch = NNFNode::And {
-                    id: max_id,
-                    children: vec![tfid],
-                    lits: vec![-lits[0]],
-                    entailed: vec![],
-                };
-                assert! {nodes.len() == tf.id()}
-                nodes.push(tf);
-                nodes[root].add_child(otherbranch.id());
-                assert! {nodes.len() == otherbranch.id()}
-                nodes.push(otherbranch);
+                panic!("this should have been handled before!");
             } else if nodes[*child].children().len() == 2 {
                 eprintln! {"changing root node to {}", child};
                 max_id -= 1;
@@ -813,7 +812,7 @@ impl<'l> NNFTracer<'l> {
                 let compid = self.issue_comp_id();
                 let (child1, child2) = match &children[..] {
                     [child1, child2] => (*child1, *child2),
-                    _ => panic! {"decision node must have tow children!"},
+                    _ => panic! {"decision node must have two children!"},
                 };
 
                 let dec_lit = match &self.nnf.nodes[child1] {
